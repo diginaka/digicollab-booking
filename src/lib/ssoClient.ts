@@ -41,45 +41,99 @@ export function redirectToHub(reason: 'login' | 'expired' = 'login'): void {
   window.location.href = `${HUB_URL}/auth?${params.toString()}`
 }
 
-export async function exchangeSsoTokens(ssoToken: string, ssoRefresh: string): Promise<void> {
-  const exchangeUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/fb-sso-exchange`
-  const res = await fetch(exchangeUrl, {
+/**
+ * SSO 引換券 (sso_code) を fb-sso-exchange Edge Function に送って
+ * access_token / refresh_token を得て setSession する。
+ * cart / course / mail / line と同方針。
+ */
+async function exchangeSsoCode(ssoCode: string): Promise<void> {
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string
+  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string
+  const res = await fetch(`${supabaseUrl}/functions/v1/fb-sso-exchange`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sso_token: ssoToken, sso_refresh: ssoRefresh, app: APP_NAME }),
+    headers: {
+      apikey: anonKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ sso_code: ssoCode }),
   })
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`SSO exchange failed: ${res.status} ${body}`)
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok || !json?.success) {
+    throw new Error(`SSO exchange failed: ${res.status} ${json?.error ?? ''}`)
   }
-  const data = await res.json()
-  if (!data.access_token || !data.refresh_token) {
+  if (!json.access_token || !json.refresh_token) {
     throw new Error('SSO exchange returned malformed tokens')
   }
   const { error } = await supabase.auth.setSession({
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
+    access_token: json.access_token,
+    refresh_token: json.refresh_token,
   })
   if (error) throw error
 }
 
+/**
+ * 旧方式 fallback: sso_token + sso_refresh をそのまま setSession に渡す。
+ * Flow Builder は移行期間中、sso_code と並行して sso_token / sso_refresh も
+ * iframe URL に付与しているため、code 交換が失敗した時の保険として残す。
+ */
+async function exchangeLegacyTokens(ssoToken: string, ssoRefresh: string): Promise<void> {
+  const { error } = await supabase.auth.setSession({
+    access_token: ssoToken,
+    refresh_token: ssoRefresh,
+  })
+  if (error) throw error
+}
+
+/**
+ * URL の SSO パラメータを消費してセッションを確立する。
+ *
+ * 優先順:
+ *   1. sso_code (新方式・1回限り引換券) → fb-sso-exchange で交換
+ *   2. sso_token + sso_refresh (旧方式・Phase α 互換) → そのまま setSession
+ *
+ * @returns SSO 消費に成功したら true、SSO パラメータが無い・全て失敗なら false
+ */
 export async function consumeSsoTokensFromUrl(): Promise<boolean> {
   const params = new URLSearchParams(window.location.search)
+  const ssoCode = params.get('sso_code')
   const ssoToken = params.get('sso_token')
   const ssoRefresh = params.get('sso_refresh')
-  if (!ssoToken || !ssoRefresh) return false
-  try {
-    await exchangeSsoTokens(ssoToken, ssoRefresh)
+
+  if (!ssoCode && !(ssoToken && ssoRefresh)) return false
+
+  const cleanUrl = () => {
+    params.delete('sso_code')
     params.delete('sso_token')
     params.delete('sso_refresh')
     const clean = params.toString()
     const newUrl = `${window.location.pathname}${clean ? `?${clean}` : ''}`
     window.history.replaceState({}, '', newUrl)
-    return true
-  } catch (err) {
-    console.error('[sso] exchange failed', err)
-    return false
   }
+
+  // 新方式: sso_code を優先で交換
+  if (ssoCode) {
+    try {
+      await exchangeSsoCode(ssoCode)
+      cleanUrl()
+      return true
+    } catch (err) {
+      console.error('[sso] sso_code exchange failed; trying legacy fallback', err)
+      // 旧方式 fallback へフォールスルー
+    }
+  }
+
+  // 旧方式 fallback: sso_token + sso_refresh
+  if (ssoToken && ssoRefresh) {
+    try {
+      await exchangeLegacyTokens(ssoToken, ssoRefresh)
+      cleanUrl()
+      return true
+    } catch (err) {
+      console.error('[sso] legacy token setSession failed', err)
+    }
+  }
+
+  return false
 }
 
 export async function signOut(): Promise<void> {
